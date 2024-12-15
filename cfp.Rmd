@@ -1,0 +1,689 @@
+---
+title: "The Champion is Here"
+subtitle: "Predicting the 2024 College Football Playoff Bracket"
+author: "Sarah Deussing, Drew Duffy, Adam El-Kadi, Jacob Kowal, and Mitch Jeter"
+date: "2024-12-11"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## College Football Data
+2015 - 2024
+```{r}
+library(cfbfastR)
+data <- load_cfb_pbp(2015:2024)
+head(data)
+#save(data, file = "data2015_2024.RData")
+```
+
+
+```{r}
+teams <- c("Oregon", "Penn State", "Notre Dame", "Georgia", "Clemson", "SMU", "Texas", "Tennessee", "Indiana", "Boise State", "Ohio State", "Arizona State")
+playoff_teams <- data[data$pos_team %in% teams | data$def_pos_team %in% teams ,]
+
+library(dplyr)
+playoff_teams <- playoff_teams %>%
+  select(season, game_id, pos_team, def_pos_team, down, down_end, distance, distance_end, yards_gained, EPA, wpa, penalty_detail, turnover, home, away, offense_play, defense_play, offense_conference, defense_conference, yds_rushed, yds_receiving, yds_sacked, yds_fg, completion, punt, fg_made, fg_make_prob, penalty_flag, yds_penalty, play_type, stuffed_run, def_EPA,) %>%
+  filter(!is.na(season))
+```
+
+Offensive & Defensive Statistics
+```{r}
+playoff_teams <- playoff_teams %>%
+  mutate(fg_difficulty = ifelse(fg_made == TRUE, yds_fg / fg_make_prob, 0),
+         conversion4th = ifelse(down == 4 & down_end == 1, 1, ifelse(down == 4 & down_end == 4, 0, NA)),
+         conversion3rd = ifelse(down == 3 & down_end == 1, 1, ifelse(down == 3 & down_end == 4, 0, NA)))
+
+# Offense
+off_stats <- playoff_teams %>% group_by(pos_team, season, game_id) %>%
+ # filter(pos_team %in% teams) %>%
+  summarize(avg_EPA = mean(EPA, na.rm = TRUE),
+            avg_WPA = mean(wpa, na.rm = TRUE),
+            total_rush_yds = sum(yds_rushed, na.rm = TRUE),
+            total_rec_yds = sum(yds_receiving, na.rm = TRUE),
+            avg_fg_difficulty = mean(fg_difficulty, na.rm = TRUE),
+            total_off_penalties = sum(penalty_flag == TRUE),
+            total_turnovers = sum(turnover, na.rm = TRUE),
+            total_punts = sum(punt == TRUE),
+            avg_conversion4th = sum(conversion4th == 1, na.rm = TRUE)/sum(!is.na(conversion4th), na.rm = TRUE),
+            avg_conversion3rd = sum(conversion3rd == 1, na.rm = TRUE)/sum(!is.na(conversion3rd), na.rm = TRUE),
+            pass_completion_perc = sum(play_type == 'Pass Reception')/sum(play_type == 'Pass Reception' | play_type == 'Pass Incompletion'),
+            tot_pass_td = sum(play_type == 'Passing Touchdown'),
+            tot_rush_td = sum(play_type == 'Rushing Touchdown'))
+
+# Defense
+def_stats <- playoff_teams %>% group_by(def_pos_team, season, game_id) %>%
+  #filter(def_pos_team %in% teams) %>%
+  summarize(avg_def_EPA = mean(def_EPA, na.rm = TRUE),
+    total_def_penalties = sum(penalty_flag == TRUE),
+    total_sacks = sum(play_type == 'Sack'),
+    total_stuffed_run = sum(stuffed_run, na.rm = TRUE),
+    total_interceptions = sum(play_type == 'Interception Return'))
+```
+
+```{r}
+combined_stats <- off_stats %>%
+  left_join(def_stats, by = c("game_id" = "game_id", "pos_team" = "def_pos_team", "season" = "season")) %>%
+  rename(team = pos_team) %>%
+  arrange(game_id, team)
+#combined_stats <- combined_stats %>%
+ # filter(team %in% teams)
+```
+
+Game Info
+```{r}
+game_info <- load_cfb_schedules(2015:2024)
+game_info <- game_info %>%
+  select(game_id, season, home_team, away_team, home_points, away_points) %>%
+  mutate(points_diff = home_points - away_points)
+
+# if team in playoff teams won, then win = 1. if team lost, win = 0
+game_info <- game_info %>%
+  mutate(win = ifelse(home_team %in% teams & points_diff > 0, 1,
+                      ifelse(away_team %in% teams & points_diff < 0, 1, 0)),
+         win_team = ifelse(points_diff > 0, home_team, away_team))
+#unique(game_info$season)
+head(game_info)
+```
+
+Football Power Index
+```{r, eval = FALSE}
+library(cfbfastR)
+library(httr)
+library(jsonlite)
+
+get_fpi_rank_end_of_season <- function(team, year) {
+  url <- "https://api.collegefootballdata.com/ratings/fpi"
+  api_key <- "V2HgJkz/rPXwIIIjiXX2anIFuXHEpVjicCOvTgxV6phHg4xTooM1BSLQSnMaE2KL"
+  
+  query <- list(year = year)
+  response <- GET(
+    url,
+    query = query,
+    add_headers(
+      Accept = "application/json",
+      Authorization = paste("Bearer", api_key)
+    )
+  )
+  
+  if (status_code(response) == 200) {
+    data <- fromJSON(content(response, as = "text"))
+    last_game_data <- data %>%
+      group_by(team) %>%
+      summarize(fpi = last(fpi)) %>%
+      arrange(desc(fpi)) %>%
+      mutate(rank = row_number())
+    team_rank <- last_game_data %>%
+      filter(team == !!team) %>%
+      select(rank) %>%
+      pull(rank)  
+    if (length(team_rank) > 0) {
+      return(team_rank)
+    } else {
+      cat("Team not found for the specified year.\n")
+    }
+  } else {
+    cat("Error:", status_code(response), "\n")
+    cat("Response content:\n", content(response, as = "text"), "\n")
+  }
+}
+
+# Input team and year
+team <- "Notre Dame"
+year <- 2015
+
+rank <- get_fpi_rank_end_of_season(team, year)
+if (!is.null(rank)) {
+  cat("End-of-season FPI rank for", team, "in", year, "is", rank, "\n")
+}
+
+```
+
+```{r, eval = FALSE}
+years <- 2015:2024
+cfp_teams <- c("Oregon", "Georgia", "Boise State", "Arizona State", "Texas", "Penn State", 
+               "Notre Dame", "Ohio State", "Tennessee", "Indiana", "SMU", "Clemson")
+
+get_fpi_rank_end_of_season <- function(team, year) {
+  url <- "https://api.collegefootballdata.com/ratings/fpi"
+  api_key <- "V2HgJkz/rPXwIIIjiXX2anIFuXHEpVjicCOvTgxV6phHg4xTooM1BSLQSnMaE2KL"
+
+  query <- list(year = year)
+  response <- GET(
+    url,
+    query = query,
+    add_headers(
+      Accept = "application/json",
+      Authorization = paste("Bearer", api_key)
+    )
+  )
+
+  if (status_code(response) == 200) {
+    data <- fromJSON(content(response, as = "text"))
+    last_game_data <- data %>%
+      group_by(team) %>%
+      summarize(fpi = last(fpi)) %>%
+      arrange(desc(fpi)) %>%
+      mutate(rank = row_number())
+    team_rank <- last_game_data %>%
+      filter(team == !!team) %>%
+      select(rank) %>%
+      pull(rank)
+    if (length(team_rank) > 0) {
+      return(team_rank)
+    } else {
+      return(NA) # Team not found for the specified year
+    }
+  } else {
+    cat("Error:", status_code(response), "\n")
+    cat("Response content:\n", content(response, as = "text"), "\n")
+    return(NA) 
+  }
+}
+
+fpi_ranks <- data.frame(Team = character(), Year = integer(), FPI_Rank = integer(), stringsAsFactors = FALSE)
+
+for (team in cfp_teams) {
+  for (year in years) {
+    rank <- get_fpi_rank_end_of_season(team, year)
+    fpi_ranks <- rbind(fpi_ranks, data.frame(Team = team, Year = year, FPI_Rank = rank))
+  }
+}
+
+print(fpi_ranks)
+write.csv(fpi_ranks, "fpi_ranks.csv", row.names = FALSE)
+```
+
+```{r}
+fpi <- read.csv('fpi_ranks.csv')
+fpi <- fpi %>% rename(team = Team, season = Year)
+
+head(fpi)
+```
+
+
+```{r}
+# combine game info
+merged <- merge(combined_stats, game_info, by = "game_id", all.x = TRUE)
+merged <- merged %>%
+  select(-season.y) %>%
+  rename(season = season.x) %>%
+  filter(!is.na(season))
+#unique(merged$season)
+
+# combine fpi
+merged <- merge(merged, fpi, by = c("team", "season"))
+```
+
+Margins & Favorites/Underdogs
+```{r, eval = FALSE}
+library(cfbfastR)
+library(jsonlite)
+library(dplyr)
+library(ggplot2)
+library(reshape2)
+library(tidyr)
+library(httr)
+
+# API endpoint
+url <- "https://api.collegefootballdata.com/lines?year=2024&seasonType=regular"
+
+# Make the GET request with the API key
+response <- GET(url, 
+                add_headers(`accept` = "application/json", 
+                            `Authorization` = paste("Bearer", api_key)))
+
+# Check response status
+if (status_code(response) == 200) {
+  # Parse response if successful
+  data <- content(response, as = "parsed", simplifyVector = TRUE)
+  dataframe <- as.data.frame(data)
+  print(head(dataframe))
+} else {
+  # Print error message
+  print(paste("Error:", status_code(response)))
+  print(content(response, as = "text"))
+}
+
+
+# Extract the 'spread' column from each element of the 'lines' list
+spreads <- lapply(dataframe$lines, function(x) x$spread)
+
+dataframe$spread <- sapply(dataframe$lines, function(x) x$formattedSpread[1])
+
+
+line15 <- dataframe %>% 
+  filter(spread != c("NULL")) %>% 
+  select(-lines)
+
+
+library(stringr)
+
+# Assuming the spread column looks like "Wyoming -13"
+line15$favorite_team <- str_extract(line15$spread, "^[^-]+")  # Extracts the team name
+line15$favorite_points <- as.numeric(str_extract(line15$spread, "-?\\d+"))
+
+
+line16 <- dataframe %>% 
+  filter(spread != c("NULL")) %>% 
+  select(-lines)
+
+line16$favorite_team <- str_extract(line16$spread, "^[^-]+")  # Extracts the team name
+line16$favorite_points <- as.numeric(str_extract(line16$spread, "-?\\d+"))
+
+
+line17 <- dataframe %>% 
+  filter(spread != c("NULL")) %>% 
+  select(-lines)
+
+line17$favorite_team <- str_extract(line17$spread, "^[^-]+")  # Extracts the team name
+line17$favorite_points <- as.numeric(str_extract(line17$spread, "-?\\d+"))
+
+line18 <- dataframe %>% 
+  filter(spread != c("NULL")) %>% 
+  select(-lines)
+
+line18$favorite_team <- str_extract(line18$spread, "^[^-]+")  # Extracts the team name
+line18$favorite_points <- as.numeric(str_extract(line18$spread, "-?\\d+"))
+
+line19 <- dataframe %>% 
+  filter(spread != c("NULL")) %>% 
+  select(-lines)
+
+line19$favorite_team <- str_extract(line19$spread, "^[^-]+")  # Extracts the team name
+line19$favorite_points <- as.numeric(str_extract(line19$spread, "-?\\d+"))
+
+line20 <- dataframe %>% 
+  filter(spread != c("NULL")) %>% 
+  select(-lines)
+
+line20$favorite_team <- str_extract(line20$spread, "^[^-]+")  # Extracts the team name
+line20$favorite_points <- as.numeric(str_extract(line20$spread, "-?\\d+"))
+
+
+combined_data <- rbind(line17, line18, line19, line20)
+
+# Write the combined_data to a CSV file
+write.csv(combined_data, "C://Users/Drew Duffy/Downloads/combined_data.csv", row.names = FALSE)
+
+library(httr)
+library(dplyr)
+library(stringr)
+
+# Function to get data for a given year and process it
+get_season_data <- function(year, api_key) {
+  # Construct the URL for the specified year
+  url <- paste0("https://api.collegefootballdata.com/lines?year=", year, "&seasonType=regular")
+  
+  # Make the GET request with the API key, set a timeout of 60 seconds
+  response <- GET(url, 
+                  add_headers(`accept` = "application/json", 
+                              `Authorization` = paste("Bearer", api_key)),
+                  timeout(60))  # Increased timeout to 60 seconds
+  
+  # Check response status
+  if (status_code(response) == 200) {
+    # Parse response if successful
+    data <- content(response, as = "parsed", simplifyVector = TRUE)
+    dataframe <- as.data.frame(data)
+    
+    # Extract the 'spread' column from each element of the 'lines' list
+    dataframe$spread <- sapply(dataframe$lines, function(x) x$formattedSpread[1])
+    
+    # Filter rows where the spread is not NULL
+    line15 <- dataframe %>% 
+      filter(spread != "NULL") %>% 
+      select(-lines)
+    
+    # Use stringr to extract favorite team and points
+    line15$favorite_team <- str_extract(line15$spread, "^[^-]+")  # Extracts the team name
+    line15$favorite_points <- as.numeric(str_extract(line15$spread, "-?\\d+"))
+    
+    return(line15)
+  } else {
+    # Print error message
+    print(paste("Error:", status_code(response)))
+    print(content(response, as = "text"))
+    return(NULL)
+  }
+}
+
+# Initialize an empty list to store data for each season
+all_seasons_data <- list()
+
+# Loop over the years from 2015 to 2024
+for (year in 2015:2024) {
+  print(paste("Processing year:", year))
+  season_data <- get_season_data(year, api_key)
+  if (!is.null(season_data)) {
+    # Add the season data to the list
+    all_seasons_data[[as.character(year)]] <- season_data
+  }
+}
+
+# Combine all the season data into a single dataframe
+margin_data <- bind_rows(all_seasons_data)
+
+# View the combined data
+
+# Optionally, save the combined data to a CSV file
+write.csv(margin_data, "combined_season_data.csv", row.names = FALSE)
+
+
+margin_data <- margin_data %>%
+  mutate(
+    favorite_score = case_when(
+      favorite_team == homeTeam ~ homeScore,
+      favorite_team == awayTeam ~ awayScore,
+      TRUE ~ NA_real_
+    ),
+    underdog_score = case_when(
+      favorite_team == homeTeam ~ awayScore,
+      favorite_team == awayTeam ~ homeScore,
+      TRUE ~ NA_real_
+    )
+  )
+
+
+head(margin_data[, c("favorite_team", "homeTeam", "awayTeam")])
+margin_data$favorite_team <- as.character(margin_data$favorite_team)
+margin_data$homeTeam <- as.character(margin_data$homeTeam)
+margin_data$awayTeam <- as.character(margin_data$awayTeam)
+
+margin_data <- margin_data %>%
+  mutate(
+    favorite_score = case_when(
+      tolower(trimws(favorite_team)) == tolower(trimws(homeTeam)) ~ homeScore,
+      tolower(trimws(favorite_team)) == tolower(trimws(awayTeam)) ~ awayScore,
+      TRUE ~ NA_real_
+    ),
+    underdog_score = case_when(
+      tolower(trimws(favorite_team)) == tolower(trimws(homeTeam)) ~ awayScore,
+      tolower(trimws(favorite_team)) == tolower(trimws(awayTeam)) ~ homeScore,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Check the output to verify the new columns
+head(margin_data[, c("favorite_team", "homeTeam", "awayTeam", "favorite_score", "underdog_score")])
+
+str(margin_data$homeScore)
+str(margin_data$awayScore)
+
+margin_data$homeScore <- as.numeric(margin_data$homeScore)
+margin_data$awayScore <- as.numeric(margin_data$awayScore)
+
+margin_data$favorite_score_diff <- as.numeric(margin_data$favorite_score - margin_data$underdog_score)
+margin_data$fav_margin <- as.numeric(margin_data$favorite_points - -(margin_data$favorite_score_diff))
+margin_data$dog_margin <- as.numeric(margin_data$favorite_points - -(margin_data$favorite_score_diff)) * -1
+
+
+
+
+margin_data <- margin_data %>% 
+  filter(!is.na(margin))
+
+margin_data <- margin_data %>%
+  mutate(
+    underdog_team = case_when(
+      tolower(trimws(favorite_team)) == tolower(trimws(homeTeam)) ~ awayTeam,  # if favorite_team is homeTeam, underdog is awayTeam
+      tolower(trimws(favorite_team)) == tolower(trimws(awayTeam)) ~ homeTeam,  # if favorite_team is awayTeam, underdog is homeTeam
+      TRUE ~ NA_character_  # if neither condition is met (shouldn't happen with valid data)
+    )
+  )
+
+# Check the output to verify the new underdog_team column
+head(margin_data[, c("favorite_team", "homeTeam", "awayTeam", "underdog_team")])
+
+
+favorite_margins <- margin_data %>% group_by(favorite_team, season) %>% 
+  summarise(favorite_margin = sum(fav_margin, na.rm = TRUE)) %>% 
+  rename(team = favorite_team) %>% 
+  mutate(season = as.factor(season))
+
+underdog_margins <- margin_data %>% group_by(underdog_team, season) %>% 
+  summarise(underdog_margin = sum(dog_margin, na.rm = TRUE)) %>% 
+  rename(team = underdog_team) %>% 
+  mutate(season = as.factor(season)) 
+
+favorite_margins$team <- trimws(favorite_margins$team) 
+underdog_margins$team <- trimws(underdog_margins$team) 
+total_margins <- full_join(favorite_margins, underdog_margins, by = c("team", "season")) 
+
+
+total_margins <- total_margins %>% 
+  mutate(favorite_margin = ifelse(is.na(favorite_margin), 0, favorite_margin), 
+         underdog_margin = ifelse(is.na(underdog_margin), 0, underdog_margin)) 
+
+
+write.csv(total_margins, "C://Users/Drew Duffy/Downloads/total_margins.csv", row.names = FALSE)
+```
+
+```{r}
+margins <- read.csv('total_margins.csv')
+merged <- merge(merged, margins, by = c('team', 'season'))
+
+head(margins)
+```
+
+Weather & Temperature Difference
+```{r}
+weather <- read.csv('cfb_weather_2015_2024.csv')
+weather <- weather %>%
+  select(game_id, season, home_team, temperature)
+
+# average team weather = yearly average temp for that team's home stadium
+avg_team_weather <- weather %>% group_by(season, home_team) %>%
+  summarize(avg_temp = mean(temperature, na.rm = TRUE))
+
+# for merge: if team == home_team, temp_diff = 0
+# else: temp_diff = get the weather for that team and subtract it from home team's weather
+merged3 <- merged %>%
+  left_join(weather, by = c("season", "game_id"))
+
+merged3 <- merged3 %>%
+  mutate(temp_diff = ifelse(home_team.y == team, 0,
+                            temperature - avg_team_weather[avg_team_weather$home_team == away_team &
+                                               avg_team_weather$season == season, ]$avg_temp))
+```
+
+
+## XGBoost Modeling
+
+Fill any NA values with zeros
+```{r}
+summary(merged)
+# fill all NAs with 0
+merged2 <- merged3 %>% mutate_all(~replace(., is.na(.), 0))
+sum(is.na(merged2))
+
+merged2$win_team_binary <- ifelse(merged2$win_team == merged2$team, 1, 0)
+
+train_data <- merged2 %>% filter(season >= 2015 & season <= 2023)
+#sum(is.na(train_data))
+test_data <- merged2 %>% filter(season == 2024)
+```
+
+Training data: 2015-2023
+```{r}
+#colnames(merged2)
+features <- c("avg_EPA", "avg_WPA", "total_rush_yds", "total_rec_yds", "avg_fg_difficulty", "total_off_penalties", "total_turnovers", "total_punts", "avg_conversion4th", "avg_conversion3rd", "pass_completion_perc", "tot_pass_td", "tot_rush_td", "avg_def_EPA", "total_def_penalties", "total_sacks", "total_stuffed_run", "total_interceptions", "FPI_Rank", "favorite_margin", "underdog_margin", "temp_diff")
+
+X_train <- train_data %>% select(all_of(features)) %>% as.matrix()
+y_train <- train_data$win_team_binary
+```
+
+Test data: Predict for 2024 regular season data
+```{r}
+library(xgboost)
+
+xgb_model <- xgboost(
+  data = X_train, 
+  label = y_train,
+  objective = "binary:logistic",  
+  eval_metric = "auc",       
+  nrounds = 1000,  
+  early_stopping_rounds = 50,
+  max_depth = 20,              
+  eta = 0.1,            
+  gamma = 0,                     
+  colsample_bytree = 0.8,        
+  subsample = 0.8,
+  verbose = 0
+)
+
+X_test <- test_data %>% select(all_of(features)) %>% as.matrix()
+y_pred_prob <- predict(xgb_model, X_test)
+
+y_pred_class <- ifelse(y_pred_prob > 0.5, 1, 0)
+test_data$predicted_win_binary <- y_pred_class
+
+test_data <- test_data %>%
+  group_by(game_id) %>%
+  mutate(predicted_win_team = ifelse(predicted_win_binary == 1, team, NA)) %>%
+  ungroup()
+
+test_data_winner <- test_data %>%
+  group_by(game_id) %>%
+  summarise(predicted_game_winner = first(predicted_win_team[!is.na(predicted_win_team)])) %>%
+  ungroup()
+
+final_predictions <- left_join(test_data, test_data_winner, by = "game_id")
+
+final_predictions$predicted_win_team <- ifelse(final_predictions$predicted_win_binary == 1, final_predictions$team, 
+                                               ifelse(final_predictions$team == final_predictions$home_team, final_predictions$away_team, final_predictions$home_team))
+
+accuracy <- mean(final_predictions$predicted_win_team == final_predictions$win_team) ## 0.882
+```
+
+Feature Importance
+```{r}
+importance_matrix <- xgb.importance(model = xgb_model)
+#xgb.plot.importance(importance_matrix)
+#print(importance_matrix)
+```
+
+```{r}
+library(ggplot2)
+importance_matrix_df <- data.frame(
+  Feature = importance_matrix$Feature,
+  Gain = importance_matrix$Gain,
+  Frequency = importance_matrix$Frequency,
+  Cover = importance_matrix$Cover
+)
+
+importance_matrix_df <- importance_matrix_df %>%
+  arrange(desc(Gain))
+
+importance_matrix_df$Top_Three <- ifelse(importance_matrix_df$Feature %in% importance_matrix_df$Feature[1:3], "Top 3", "Other")
+
+ggplot(importance_matrix_df, aes(x = reorder(Feature, Gain), y = Gain, fill = Top_Three)) +
+  geom_bar(stat = "identity", show.legend = FALSE) +
+  scale_fill_manual(values = c("Top 3" = "red", "Other" = "gray")) +
+  coord_flip() +  # Flip coordinates for horizontal bars
+  labs(title = "Feature Importance", x = "Features", y = "Gain") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(size = 10),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(hjust = 0.5, size = 14, face = "bold"),
+  panel.grid = element_blank())
+
+
+```
+
+## Predict Playoffs
+
+Function to simulate playoff game: summarize 2024 data for matchup teams.
+```{r}
+predict_game_winner <- function(team_1, team_2, game_stats_2024, xgb_model, features) {
+  team_1_stats <- game_stats_2024 %>%
+    filter(season == 2024 & team == team_1)
+  
+  team_2_stats <- game_stats_2024 %>%
+    filter(season == 2024 & team == team_2)
+
+  team_1_avg_stats <- team_1_stats %>%
+    summarise(across(all_of(features), mean, na.rm = TRUE))
+  
+  team_2_avg_stats <- team_2_stats %>%
+    summarise(across(all_of(features), mean, na.rm = TRUE))
+
+  game_prediction_data <- bind_rows(team_1_avg_stats, team_2_avg_stats) %>%
+    mutate(team = c(team_1, team_2))
+  game_pred2 <- game_prediction_data
+  colnames(game_pred2) <- features
+  rownames(game_pred2) <- c(team_1, team_2)
+  
+  game_matrix <- as.matrix(game_prediction_data %>% select(-team))
+  
+  y_pred_prob <- predict(xgb_model, game_matrix)
+
+  predicted_winner <- ifelse(y_pred_prob[1] > y_pred_prob[2], team_1, team_2)
+  
+  return(list(predicted_winner = predicted_winner, game_pred2 = game_pred2))
+}
+```
+
+Simulate Bracket
+```{r}
+# First round:
+winner7_10 <- predict_game_winner("Notre Dame", "Indiana", merged2, xgb_model, features)$predicted_winner
+print(paste0("Notre Dame v. Indiana: ", winner7_10))
+game7_10 <- predict_game_winner("Notre Dame", "Indiana", merged2, xgb_model, features)$game_pred2
+
+winner8_9 <- predict_game_winner("Ohio State", "Tennessee", merged2, xgb_model, features)$predicted_winner
+print(paste0("Ohio State v. Tennessee: ", winner8_9))
+game8_9 <- predict_game_winner("Ohio State", "Tennessee", merged2, xgb_model, features)$game_pred2
+
+winner5_12 <- predict_game_winner("Texas", "Clemson", merged2, xgb_model, features)$predicted_winner
+print(paste0("Texas v. Clemson: ", winner5_12))
+game5_12 <- predict_game_winner("Texas", "Clemson", merged2, xgb_model, features)$game_pred2
+
+winner6_11 <- predict_game_winner("Penn State", "SMU", merged2, xgb_model, features)$predicted_winner
+print(paste0("Penn State v. SMU: ", winner6_11))
+game6_11 <- predict_game_winner("Penn State", "SMU", merged2, xgb_model, features)$game_pred2
+
+# Second Round
+winner1 <- predict_game_winner("Oregon", winner8_9, merged2, xgb_model, features)$predicted_winner
+print(paste0("Oregon v. ", winner8_9, ": ", winner1))
+game1 <- predict_game_winner("Oregon", winner8_9, merged2, xgb_model, features)$game_pred2
+
+winner2 <- predict_game_winner("Georgia", winner7_10, merged2, xgb_model, features)$predicted_winner
+print(paste0("Georgia v. ", winner7_10, ": ", winner2))
+game2 <- predict_game_winner("Georgia", winner7_10, merged2, xgb_model, features)$game_pred2
+
+winner3 <- predict_game_winner("Boise State", winner6_11, merged2, xgb_model, features)$predicted_winner
+print(paste0("Boise State v. ", winner6_11, ": ", winner3))
+game3 <- predict_game_winner("Boise State", winner6_11, merged2, xgb_model, features)$game_pred2
+
+winner4 <- predict_game_winner("Arizona State", winner5_12, merged2, xgb_model, features)$predicted_winner
+print(paste0("Arizona State v. ", winner5_12, ": ", winner4))
+game4 <- predict_game_winner("Arizona State", winner5_12, merged2, xgb_model, features)$game_pred2
+
+# Semis
+winner1_semi <- predict_game_winner(winner1, winner4, merged2, xgb_model, features)$predicted_winner
+print(paste0(winner1, " v. ", winner4, ": ", winner1_semi))
+game1_semi <- predict_game_winner(winner1, winner4, merged2, xgb_model, features)$game_pred2
+
+winner2_semi <- predict_game_winner(winner2, winner3, merged2, xgb_model, features)$predicted_winner
+print(paste0(winner2, " v. ", winner3, ": ", winner2_semi))
+game2_semi <- predict_game_winner(winner2, winner3, merged2, xgb_model, features)$game_pred2
+
+# Champion
+champion <- predict_game_winner(winner1_semi, winner2_semi, merged2, xgb_model, features)$predicted_winner
+print(paste0("Champion 2024: ", champion))
+champ_game <- predict_game_winner(winner1_semi, winner2_semi, merged2, xgb_model, features)$game_pred2
+
+#predict_game_winner("Penn State", "Ohio State", merged2, xgb_model)
+```
+
+Combine team data for comparison
+```{r}
+playoff_stats_output <- rbind(game5_12, game6_11, game7_10, game8_9, game1, game2, game3, game4, game1_semi, game2_semi, champ_game)
+#write.csv(playoff_stats_output, 'playoff_stats_output.csv')
+playoff_stats_output
+```
+
